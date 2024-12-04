@@ -1,19 +1,22 @@
+from termios import N_STRIP
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-batch_size = 64 #64 # how many parallel processing batches
-block_size = 256 #256 # max size of context
-max_iters = 3000 # 3000
+batch_size = 32 #64 # how many parallel processing batches
+block_size = 64 #256 # max size of context
+max_iters = 5000 # 3000
 eval_interval = 500
 learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters  = 200
-n_embd =  384 # # 384
-n_head =  6 # 6   #  384 / 6 = 64.0 
-n_layer = 6 # 6
-dropout = 0.15 # 0.2
-
+n_embd =  192 # # 384
+n_head =  3 # 6   #  384 / 6 = 64.0 
+n_layer = 3 # 6
+dropout = 0.10 # 0.2
+default_gravity_strength = 5.25
+default_gravity_on = True
+default_gravity_target = torch.full((batch_size, block_size, block_size), block_size//2, dtype=torch.float32)
 torch.manual_seed(1337)
 
 with open('input.txt', 'r', encoding='utf-8') as f:
@@ -77,35 +80,47 @@ class Head(nn.Module):
         self.dropout = nn.Dropout(dropout)
         # Gravity well configuration
         # Example initial positions
-        self.gravity_target = nn.Parameter(torch.tensor([2, 5, 8], dtype=torch.float32))  
-        self.gravity_strength = 0.025 
-        self.gravity_on = True
+        self.gravity_target = nn.Parameter(default_gravity_target)  
+        self.gravity_strength = default_gravity_strength 
+        self.gravity_on = default_gravity_on
 
-    def compute_gravity_term(self, T, gravity_target, gravity_strength):
+    def compute_gravity_term(self, x, gravity_strength):
         """
-        Compute a gravity term to bias attention toward target positions.
-        - T: Length of the sequence.
-        - gravity_target: Tensor of shape (num_targets,) with positions to bias toward.
-        - gravity_strength: Strength of the gravitational pull.
-        - device: The device (CPU or CUDA) to perform computation on.
+        Compute gravity term for a tensor.
+        
+        Args:
+            x (tensor): target tensor (batch_size, seq_len, feature_dim)..
+            gravity_targets (list): List of target positions in the sequence dimension.
+            gravity_strength (float): Strength of the gravity pull.
+        Returns:
+            torch.Tensor: Gravity term tensor of shape `shape`.
         """
-        # Generate position indices (1D tensor)
-        positions = torch.arange(T, device=device).unsqueeze(0)  
-        # Shape: (1, T)
-        # Expand targets and positions to compute pairwise distances
-        targets = gravity_target.unsqueeze(1)  
-        # Shape: (num_targets, 1)
-        # Compute pairwise distances |i - target| (broadcasting)
-        distances = torch.abs(positions - targets)  # Shape: (num_targets, T)
-        # Compute gravity well for each target and position
-        gravity_values = -gravity_strength / (distances**2 + 1e-6)  # Shape: (num_targets, T)
-        # Combine into a single gravity term matrix (sum over all targets)
-        gravity_term = torch.sum(gravity_values, dim=0)  # Shape: (T,)
-        # Expand gravity_term into a square matrix (T, T) for attention scores
-        gravity_matrix = torch.zeros((T, T), device=device)
-        gravity_matrix += gravity_term.unsqueeze(0)  # Add row-wise bias
-        return gravity_matrix
+        B,T,C = x.shape
+        torch.cuda.empty_cache()
 
+        # Adjust based on GPU capacity
+        gravity_term = torch.zeros((1, T, 1), device=device)
+        gravity_target = self.gravity_target.view(-1, 1, 1).expand(-1, T, 1)
+        for start in range(0, T, block_size):
+            end = min(start + block_size, T)
+            positions_chunk = torch.arange(start, end, device=device).view(1, -1, 1)
+            distances_chunk = (positions_chunk - gravity_target).abs()
+            distances_sq_chunk = distances_chunk * distances_chunk
+            gravity_term[:, start:end, :] = -gravity_strength / (distances_sq_chunk + 1e-6).sum(dim=0, keepdim=True)
+        # 1. Convert gravity_targets to a tensor
+        # 2. Compute gravity contributions for all targets
+        # 3. Shape: (num_targets, T, 1)
+        # 4. Sum contributions from all targets
+        # positions = torch.arange(T, device=device).view(1, T, 1)  # Shape: (1, T, 1)
+        # Assuming you want to apply gravity well at positions 64, 256, and 192 across the sequence
+        #gravity_target = self.gravity_target.view(-1, 1, 1).expand(-1, T, 1)  
+        # Shape: [1, T, 1]
+        #distances = (positions - gravity_target).abs()  # Shape: (num_targets, T, 1)  
+        # Gravity only affects sequence positions
+        # gravity_contributions = -gravity_strength / (distances**2 + 1e-6)
+        # gravity_term = gravity_contributions.sum(dim=0)  # Shape: (T, 1)
+        return gravity_term
+    
     def forward(self, x):
         B,T,C = x.shape
         k = self.key(x) # B,T,C
@@ -116,7 +131,7 @@ class Head(nn.Module):
         weight = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5
         # Optional: Add gravity well bias to attention scores
         if self.gravity_on:
-            gravity_term = self.compute_gravity_term(T, self.gravity_target, self.gravity_strength)
+            gravity_term = self.compute_gravity_term(x, self.gravity_strength)
             if torch.rand(1, device=device).item() < 0.5:
                 weight += gravity_term
         # (T, T)
