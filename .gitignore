@@ -1,0 +1,8 @@
+/.idea
+ml.iml
+./GPT/input.txt
+./GPT/shakespeare.txt
+./GPT/training/*
+./GPT/__pycache__/
+./nuforc_list.csv
+./column_values.txt
