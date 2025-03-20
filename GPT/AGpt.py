@@ -25,7 +25,7 @@ torch.manual_seed(1337)
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
-with open('tokenizer.pkl', 'rb') as f:
+with open('../tokenizer.pkl', 'rb') as f:
     vocab, merges = pickle.load(f)
 
 tokenizer = BasicTokenizer()

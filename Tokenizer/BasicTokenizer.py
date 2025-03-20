@@ -64,6 +64,6 @@ with open('taylorswift.txt', 'r', encoding='utf-8') as f:
     swift_text = f.read()
 tokenizer = BasicTokenizer()
 tokenizer.train(swift_text, 276, True)
-with open('tokenizer.pkl', 'wb') as f:
+with open('../tokenizer.pkl', 'wb') as f:
     pickle.dump((tokenizer.vocab, tokenizer.merges), f)
 print(tokenizer.decode(tokenizer.encode("Joku huhhuh jaa")))
