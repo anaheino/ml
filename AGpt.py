@@ -1,7 +1,8 @@
-from termios import N_STRIP
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import pickle
+from BasicTokenizer import BasicTokenizer
 
 batch_size = 32 #64 # how many parallel processing batches
 block_size = 64 #256 # max size of context
@@ -19,17 +20,20 @@ default_gravity_on = True
 default_gravity_target = torch.full((batch_size, block_size, block_size), block_size//2, dtype=torch.float32)
 torch.manual_seed(1337)
 
+
+
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
-chars = sorted(list(set(text))) # unique chars as vocabulary
-vocab_size = len(chars) 
-# mapping chars to integers, basically enumerate through, 
-# and then use the index of the char as the tokenized version
-stoi = { ch:i for i,ch in enumerate(chars)} # basic dict with chars as index
-itos = {i:ch for i,ch in enumerate(chars)} # same as above, but reversed
-encode = lambda s: [stoi[c] for c in s] # so for each char in the input, replace with it's index
-decode = lambda l: ''.join(itos[i] for i in l) # each integer in input, replace with it's char representation
+with open('tokenizer.pkl', 'rb') as f:
+    vocab, merges = pickle.load(f)
+
+tokenizer = BasicTokenizer()
+tokenizer.vocab = vocab
+tokenizer.merges = merges
+encode = lambda s: tokenizer.encode(s)  # encode using the trained BPE tokenizer
+decode = lambda l: tokenizer.decode(l)  # decode using the trained BPE tokenizer
+vocab_size = 276
 
 data = torch.tensor(encode(text), dtype=torch.long) # convert to tensor for handling
 n = int(0.9*len(data))
@@ -90,14 +94,11 @@ class Head(nn.Module):
         
         Args:
             x (tensor): target tensor (batch_size, seq_len, feature_dim)..
-            gravity_targets (list): List of target positions in the sequence dimension.
             gravity_strength (float): Strength of the gravity pull.
         Returns:
             torch.Tensor: Gravity term tensor of shape `shape`.
         """
         B,T,C = x.shape
-        torch.cuda.empty_cache()
-
         # Adjust based on GPU capacity
         gravity_term = torch.zeros((1, T, 1), device=device)
         gravity_target = self.gravity_target.view(-1, 1, 1).expand(-1, T, 1)
@@ -107,15 +108,14 @@ class Head(nn.Module):
             distances_chunk = (positions_chunk - gravity_target).abs()
             distances_sq_chunk = distances_chunk * distances_chunk
             gravity_term[:, start:end, :] = -gravity_strength / (distances_sq_chunk + 1e-6).sum(dim=0, keepdim=True)
-        # 1. Convert gravity_targets to a tensor
+        # 1. Convert gravity_target to a tensor
         # 2. Compute gravity contributions for all targets
-        # 3. Shape: (num_targets, T, 1)
-        # 4. Sum contributions from all targets
+        # 3. Sum contributions from all targets
         # positions = torch.arange(T, device=device).view(1, T, 1)  # Shape: (1, T, 1)
         # Assuming you want to apply gravity well at positions 64, 256, and 192 across the sequence
-        #gravity_target = self.gravity_target.view(-1, 1, 1).expand(-1, T, 1)  
+        # gravity_target = self.gravity_target.view(-1, 1, 1).expand(-1, T, 1)  
         # Shape: [1, T, 1]
-        #distances = (positions - gravity_target).abs()  # Shape: (num_targets, T, 1)  
+        # distances = (positions - gravity_target).abs()  # Shape: (num_targets, T, 1)  
         # Gravity only affects sequence positions
         # gravity_contributions = -gravity_strength / (distances**2 + 1e-6)
         # gravity_term = gravity_contributions.sum(dim=0)  # Shape: (T, 1)
@@ -125,6 +125,7 @@ class Head(nn.Module):
         B,T,C = x.shape
         k = self.key(x) # B,T,C
         q = self.query(x) # B,T,C
+        v = self.value(x)  # B,T,C
         # compute attention scores, aka affinities
         # C**-0.5 on käytännössä neliöjuuri 
         # (B, T, C) @ (B, C, T) -> (B, T, T), matrix multiplication
@@ -141,7 +142,6 @@ class Head(nn.Module):
         weight = F.softmax(weight, dim=-1)  # Normalize to get attention weights
         weight = self.dropout(weight)
 
-        v = self.value(x)  # (B, T, C)
         out = weight @ v  # (B, T, T) @ (B, T, C) -> (B, T, C)
         return out
     
@@ -193,6 +193,30 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class GatedFeedForward(nn.Module):
+    """FeedForward with a gating mechanism."""
+    def __init__(self, n_embd):
+        super().__init__()
+        self.fc1 = nn.Linear(n_embd, 4 * n_embd)
+        self.fc2 = nn.Linear(4 * n_embd, n_embd)
+        self.gate = nn.Linear(n_embd, n_embd)  # Gate mechanism
+        self.dropout = nn.Dropout(dropout)
+        self.activation = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # Regular feed-forward path
+        hidden = self.activation(self.fc1(x))
+        hidden = self.dropout(hidden)
+        hidden = self.fc2(hidden)
+
+        # Gating mechanism
+        gate = self.sigmoid(self.gate(x))  # Learn which parts to keep
+        gated_output = gate * hidden + (1 - gate) * x  # Combine with input
+
+        return gated_output
+
+
 class Block(nn.Module):
     """Transformer block: communcation followed by computation"""
 
@@ -206,6 +230,7 @@ class Block(nn.Module):
         # n:lle (k,v,q) nodeille async parallel processing
         self.sa = MultiThreadAttention(n_head, head_size) 
         # käytännössä await, eli combine results
+        # GatedFeedForward(n_embd)
         self.ffwd = FeedForward(n_embd)
         # normalizing values across rows, normalisointikerros
         self.ln1 = nn.LayerNorm(n_embd) 
